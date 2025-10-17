@@ -199,6 +199,128 @@ classDiagram
     BatchPoints "1" *-- "many" Point: contains
 ```
 
+# Execute 接口设计
+
+Execute 接口提供了一个统一的 SQL 执行接口，可以自动将不同类型的语句路由到相应的底层方法。该设计支持类 SQL 语句，包括 INSERT、SELECT、CREATE、DROP 和其他数据库操作，并提供参数支持和类型安全。
+
+```mermaid
+classDiagram
+    class OpenGeminiClient {
+        + ExecuteResult Execute(Statement statement)
+        + ExecuteResult ExecuteContext(Context ctx, Statement statement)
+    }
+    
+    class Statement {
+        + String database
+        + String command
+        + Map~String, Object~ params
+        + String retentionPolicy
+    }
+    
+    class ExecuteResult {
+        + QueryResult queryResult
+        + int64 affectedRows
+        + StatementType statementType
+        + Error error
+    }
+    
+    class StatementType {
+        <<enum>>
+        StatementTypeUnknown
+        StatementTypeQuery    // SELECT, SHOW, EXPLAIN → 路由到 Query()
+        StatementTypeCommand  // CREATE, DROP, ALTER → 路由到 Query()
+        StatementTypeInsert   // INSERT → 路由到 Write 方法
+        + String() String
+        + IsQueryLike() bool
+        + IsWriteLike() bool
+    }
+    
+    OpenGeminiClient --> Statement : 使用
+    OpenGeminiClient --> ExecuteResult : 返回
+    ExecuteResult --> StatementType : 包含
+    ExecuteResult --> QueryResult : 包含
+```
+
+## 语句路由逻辑
+
+```mermaid
+flowchart TD
+    A[执行语句] --> B{解析语句类型}
+    B -->|SELECT, SHOW, EXPLAIN, DESCRIBE, WITH| C[StatementTypeQuery]
+    B -->|CREATE, DROP, ALTER, UPDATE, DELETE| D[StatementTypeCommand]  
+    B -->|INSERT| E[StatementTypeInsert]
+    B -->|其他| F[StatementTypeUnknown]
+    
+    C --> G[路由到 Query 方法]
+    D --> G[路由到 Query 方法]
+    E --> H[路由到 Write 方法]
+    F --> I[返回错误]
+    
+    G --> J[返回 QueryResult + AffectedRows=0/1]
+    H --> K[返回 AffectedRows=数据点数量]
+    I --> L[返回错误结果]
+```
+
+## 参数支持
+
+Execute 接口支持参数化语句并自动进行类型转换：
+
+```mermaid
+classDiagram
+    class ParameterTypes {
+        <<enum>>
+        String    // "value" → value  
+        Integer   // 42 → 42i
+        UInteger  // 42 → 42u  
+        Float     // 3.14 → 3.14
+        Boolean   // true → true
+    }
+    
+    class ParameterProcessor {
+        + replaceParams(command String, params Map) String
+        + convertParamValue(value Object) String
+        + validateParams(command String, params Map) Error
+    }
+    
+    Statement --> ParameterProcessor : 使用
+    ParameterProcessor --> ParameterTypes : 转换
+```
+
+## 使用示例
+
+### 基本用法
+```go
+result, err := client.Execute(opengemini.Statement{
+    Database: "mydb",
+    Command:  "SELECT * FROM weather LIMIT 10",
+})
+```
+
+### 参数化查询
+```go
+result, err := client.Execute(opengemini.Statement{
+    Database: "mydb", 
+    Command:  "SELECT * FROM weather WHERE location=$loc AND temp>$temp",
+    Params: map[string]any{
+        "loc":  "beijing",
+        "temp": 25.0,
+    },
+})
+```
+
+### 参数化插入
+```go
+result, err := client.Execute(opengemini.Statement{
+    Database: "mydb",
+    Command:  "INSERT weather,location=$location temperature=$temp,humidity=$hum",
+    Params: map[string]any{
+        "location": "shanghai", 
+        "temp":     30.2,
+        "hum":      70,
+    },
+})
+```
+
 # 查询设计
 
 ```mermaid
@@ -236,33 +358,39 @@ classDiagram
 拦截器模式定义了标准化接口，用于挂钩客户端操作（查询/写入）并注入遥测逻辑。
 
 ```mermaid
-Interceptor interface {
-	Query(ctx context.Context, query *InterceptorQuery) InterceptorClosure
-	Write(ctx context.Context, write *InterceptorWrite) InterceptorClosure
-}
+classDiagram
+    class Interceptor {
+        <<interface>>
+        + Query(ctx context.Context, query *InterceptorQuery) InterceptorClosure
+        + Write(ctx context.Context, write *InterceptorWrite) InterceptorClosure
+    }
 ```
 
 ## 定义基础客户端类，关联拦截器接口
 基础 Client 类管理一组拦截器，允许在客户端操作期间动态注册和执行拦截器逻辑。
 
 ```mermaid
-class Client {
-- []Interceptor interceptors
-}
+classDiagram
+    class Client {
+        - interceptors: List~Interceptor~
+    }
 ```
 
 ## 定义集成 OpenTelemetry 的拦截器实现类，实现 Interceptor 接口
 OtelClient 类实现 Interceptor 接口，嵌入 OpenTelemetry 逻辑以捕获客户端操作的跟踪、指标和日志。
 
 ```mermaid
-class OtelClient {
-    Interceptor
-}
+classDiagram
+    class OtelClient {
+        <<implements Interceptor>>
+    }
+    OtelClient ..|> Interceptor : implements
 ```
 
 ## 追踪系统核心模块
 
 ```mermaid
+classDiagram
     class TraceContext {
         + traceId: String
         + parentTraceId: String
@@ -370,7 +498,7 @@ class OtelClient {
 
 ## 使用示例(Go language examples)
 
-```mermaid
+```go
 func main() {
     var ctx = context.Background()
     shutdown, err := setupOtelSDK(ctx)
